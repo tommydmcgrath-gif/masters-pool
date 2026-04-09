@@ -1,5 +1,6 @@
 import { ApiPlayer, LeaderboardProvider, PlayerStatus } from "../types";
 
+// Primary ESPN leaderboard endpoint
 const ESPN_LEADERBOARD_URL =
   "https://site.api.espn.com/apis/site/v2/sports/golf/pga/leaderboard";
 
@@ -13,78 +14,109 @@ export class EspnProvider implements LeaderboardProvider {
     tournamentRound: string;
     players: ApiPlayer[];
   }> {
-    const res = await fetch(ESPN_LEADERBOARD_URL, {
-      next: { revalidate: 30 },
-    });
+    const res = await fetch(ESPN_LEADERBOARD_URL, { cache: "no-store" });
 
     if (!res.ok) {
-      throw new Error(`ESPN API returned ${res.status}`);
+      throw new Error(`ESPN API returned ${res.status}: ${res.statusText}`);
     }
 
     const data = await res.json();
+
+    // Log the top-level keys so we can debug in Vercel function logs
+    console.log("ESPN response keys:", Object.keys(data));
+
     const event = data.events?.[0];
     if (!event) {
-      throw new Error("No active event found on ESPN");
+      // Return an empty leaderboard rather than crashing so the page still loads
+      console.warn("No active event found on ESPN — returning empty leaderboard");
+      return {
+        tournamentName: "The Masters",
+        tournamentRound: "Not Started",
+        players: [],
+      };
     }
 
-    const tournamentName = event.name ?? "The Masters";
-    const competition = event.competitions?.[0];
-    const statusDetail = event.status?.type?.detail ?? "";
-    const tournamentRound = statusDetail || "In Progress";
+    console.log("Event name:", event.name, "| Status:", event.status?.type?.name);
 
-    const competitors = competition?.competitors ?? [];
-    const players: ApiPlayer[] = competitors.map((c: any) =>
-      parseCompetitor(c)
-    );
+    const tournamentName: string = event.name ?? "The Masters";
+    const competition = event.competitions?.[0];
+
+    // Build round label
+    const period: number = event.status?.period ?? 0;
+    const statusName: string = event.status?.type?.name ?? "";
+    const statusDetail: string = event.status?.type?.detail ?? "";
+    let tournamentRound = "In Progress";
+    if (statusDetail) tournamentRound = statusDetail;
+    else if (period > 0) tournamentRound = `Round ${period}`;
+
+    const competitors: any[] = competition?.competitors ?? [];
+    console.log(`Parsing ${competitors.length} competitors`);
+
+    const players: ApiPlayer[] = competitors.map((c: any) => parseCompetitor(c));
 
     return { tournamentName, tournamentRound, players };
   }
 }
 
 function parseCompetitor(c: any): ApiPlayer {
+  // ── Name ──────────────────────────────────────────────────────────────────
   const athlete = c.athlete ?? {};
-  const name: string = athlete.displayName ?? "Unknown";
+  const name: string = athlete.displayName ?? athlete.fullName ?? "Unknown";
 
-  // Position — ESPN stores it as a string like "T3" or "1"
-  const position: string = c.sortOrder
-    ? String(c.status?.position?.displayName ?? c.sortOrder)
-    : "-";
+  // ── Position ──────────────────────────────────────────────────────────────
+  // ESPN may store position as c.status.position.displayName or just sortOrder
+  const posDisplay: string =
+    c.status?.position?.displayName ??
+    c.status?.position?.id ??
+    "";
+  const position: string = posDisplay || (c.sortOrder ? `${c.sortOrder}` : "-");
 
-  // Total score relative to par — ESPN gives this as a display string like "-5" or "E"
-  const scoreStr: string = c.score?.displayValue ?? c.score ?? "0";
+  // ── Total score (relative to par) ─────────────────────────────────────────
+  // c.score can be a string like "-5", "E", or an object { displayValue: "-5" }
+  const rawScore = c.score;
+  const scoreStr: string =
+    typeof rawScore === "object" && rawScore !== null
+      ? (rawScore.displayValue ?? rawScore.value ?? "0")
+      : String(rawScore ?? "0");
   const totalScore = parseScoreString(scoreStr);
 
-  // Today's round score
-  const todayStr: string =
-    c.status?.displayValue ??
-    c.linescores?.[c.linescores.length - 1]?.displayValue ??
-    "";
-  const todayScore = todayStr ? parseScoreString(todayStr) : null;
+  // ── Today's score ─────────────────────────────────────────────────────────
+  // ESPN uses linescores[] for per-round stroke totals
+  // The last entry is the current / most recent round
+  const linescores: any[] = c.linescores ?? [];
+  const lastLine = linescores[linescores.length - 1];
+  const todayRawStr: string =
+    lastLine?.displayValue ?? lastLine?.value ?? "";
+  // "today" score is relative to par — ESPN may give strokes; we'll convert later
+  // For simplicity just store it as-is and mark null if empty
+  const todayScore: number | null = todayRawStr ? parseScoreString(String(todayRawStr)) : null;
 
-  // Thru — how many holes completed today
-  const period = c.status?.period ?? 0;
-  const thruValue = c.status?.thru ?? c.status?.displayValue ?? "-";
-  const thru = String(thruValue);
+  // ── Thru ──────────────────────────────────────────────────────────────────
+  const thruRaw = c.status?.thru ?? lastLine?.displayValue ?? "-";
+  const thru: string = String(thruRaw);
 
-  // Round scores (strokes, not relative to par)
-  const rounds: number[] = (c.linescores ?? [])
+  // ── Round stroke totals ───────────────────────────────────────────────────
+  const rounds: number[] = linescores
     .map((ls: any) => {
-      const val = ls.value ?? ls.displayValue;
-      return typeof val === "number" ? val : parseInt(val, 10);
+      const v = ls.value ?? ls.displayValue;
+      const n = typeof v === "number" ? v : parseInt(String(v), 10);
+      return n;
     })
-    .filter((n: number) => !isNaN(n));
+    .filter((n: number) => !isNaN(n) && n > 0);
 
-  // Status — detect cut, withdrawn, DQ
-  const statusType: string =
+  // ── Status ────────────────────────────────────────────────────────────────
+  const statusTypeName: string =
     c.status?.type?.name ?? c.status?.type?.description ?? "";
-  const status = mapStatus(statusType, position);
+  const status = mapStatus(statusTypeName, position);
 
   return { name, position, totalScore, todayScore, thru, rounds, status };
 }
 
 function parseScoreString(s: string): number {
-  if (!s || s === "E" || s === "Even" || s === "-") return 0;
-  const n = parseInt(s, 10);
+  if (!s) return 0;
+  const trimmed = s.trim();
+  if (trimmed === "E" || trimmed === "Even" || trimmed === "-" || trimmed === "") return 0;
+  const n = parseInt(trimmed, 10);
   return isNaN(n) ? 0 : n;
 }
 
@@ -93,9 +125,6 @@ function mapStatus(statusType: string, position: string): PlayerStatus {
   if (lower.includes("cut")) return "cut";
   if (lower.includes("wd") || lower.includes("withdraw")) return "withdrawn";
   if (lower.includes("dq") || lower.includes("disqual")) return "disqualified";
-
-  // Some ESPN feeds put "CUT" in the position field
   if (position.toUpperCase() === "CUT") return "cut";
-
   return "active";
 }
