@@ -97,13 +97,18 @@ function parseCompetitor(c: any): ApiPlayer {
 
   // ── Round stroke totals ─────────────────────────────────────────────────
   // linescores[].value = strokes for that round (e.g. 68.0)
-  // Skip rounds with value 0 (not played)
+  // IMPORTANT: Only include COMPLETED rounds. Partial rounds (in-progress)
+  // have low stroke totals (e.g. 43 through 11 holes) which would break
+  // the missed-cut penalty calculation (43 - 72 = -29 looks like a great
+  // score instead of an incomplete one). A completed round at Augusta is
+  // always 60+ strokes, so we use that as a threshold.
+  const MIN_COMPLETE_ROUND_STROKES = 60;
   const rounds: number[] = (c.linescores ?? [])
     .map((ls: any) => {
       const v = typeof ls.value === "number" ? ls.value : parseFloat(ls.value);
       return v;
     })
-    .filter((n: number) => !isNaN(n) && n > 0);
+    .filter((n: number) => !isNaN(n) && n >= MIN_COMPLETE_ROUND_STROKES);
 
   return { name, position, totalScore, todayScore, thru, rounds, status };
 }
